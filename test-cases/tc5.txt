@@ -1,0 +1,2 @@
+source prog8
+quit
