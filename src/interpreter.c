@@ -67,6 +67,33 @@ int badcommandExecLoad();
 int parse_policy(char *policy_text, SchedulePolicy *out_policy);
 int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy policy, int print_exec_load_error, int background_mode);
 
+typedef struct ScriptPlan {
+    char script_name[256];
+    char backing_path[512];
+    int needs_load;
+    int line_count;
+    int num_pages;
+} ScriptPlan;
+
+typedef struct LoadedScriptRollback {
+    char script_name[256];
+    int *page_table;
+    int num_pages;
+    int loaded_now;
+} LoadedScriptRollback;
+
+static int get_script_name_from_path(const char *path, char *script_name_out, size_t script_name_size) {
+    // A3 1.2.1: duplicate detection is based on script filename, not the full source path.
+    const char *base = strrchr(path, '/');
+    base = (base == NULL) ? path : base + 1;
+
+    if (*base == '\0' || snprintf(script_name_out, script_name_size, "%s", base) >= (int)script_name_size) {
+        return 1;
+    }
+
+    return 0;
+}
+
 // Interpret commands and their arguments
 int interpreter(char *command_args[], int args_size) {
     int i;
@@ -216,67 +243,157 @@ int parse_policy(char *policy_text, SchedulePolicy *out_policy) {
     return 1;
 }
 
+static void rollback_loaded_scripts(LoadedScriptRollback loaded_scripts[], int count) {
+    // A3 1.2.1: unwind partially completed eager loads on any failure path.
+    for (int i = 0; i < count; i++) {
+        if (loaded_scripts[i].loaded_now) {
+            // A3 1.2.1: remove the shared-script registry entry, then free its frames.
+            mem_unregister_script(loaded_scripts[i].script_name);
+            mem_release_frames(loaded_scripts[i].page_table, loaded_scripts[i].num_pages);
+        }
+        free(loaded_scripts[i].page_table);
+        loaded_scripts[i].page_table = NULL;
+    }
+}
+
+static void free_planned_pcbs(PCB *pcbs[], int count) {
+    // A3 1.2.1: helper for cleaning up PCB allocations before queue insertion.
+    for (int i = 0; i < count; i++) {
+        free_pcb(pcbs[i]);
+        pcbs[i] = NULL;
+    }
+}
+
 int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy policy, int print_exec_load_error, int background_mode) {
-    // A2 1.2.2: Shared load/validation path used by both source and exec.
-    // This keeps code loading, PCB creation, and queue setup policy-agnostic.
-    int starts[3];
-    int ends[3];
+    // A3 1.2.1: copy scripts into backing_store and plan eager page loading.
+    ScriptPlan plans[3] = { 0 };
+    LoadedScriptRollback loaded_scripts[3] = { 0 };
     PCB *pcbs[3] = { NULL, NULL, NULL };
-    char line[MAX_USER_INPUT];
+    int total_new_pages = 0;
+    int loaded_count = 0;
 
     for (int i = 0; i < script_count; i++) {
-        starts[i] = -1;
-        ends[i] = -1;
-    }
+        int already_planned = -1;
 
-    for (int i = 0; i < script_count; i++) {
-        FILE *p = fopen(scripts[i], "rt");
-        if (p == NULL) {
-            for (int j = 0; j < i; j++) {
-                mem_cleanup_script(starts[j], ends[j]);
-            }
+        if (get_script_name_from_path(scripts[i], plans[i].script_name, sizeof(plans[i].script_name)) != 0) {
             if (print_exec_load_error) {
                 return badcommandExecLoad();
             }
             return 1;
         }
 
-        while (fgets(line, MAX_USER_INPUT - 1, p) != NULL) {
-            int idx = mem_load_script_line(line);
-            if (idx < 0) {
-                fclose(p);
-                if (starts[i] >= 0) {
-                    mem_cleanup_script(starts[i], ends[i]);
-                }
-                for (int j = 0; j < i; j++) {
-                    mem_cleanup_script(starts[j], ends[j]);
-                }
-                if (print_exec_load_error) {
-                    return badcommandExecLoad();
-                }
-                return 1;
+        // A3 1.2.1: if the script is already loaded, later PCBs will reuse its frames.
+        if (mem_is_script_loaded(plans[i].script_name)) {
+            continue;
+        }
+
+        // A3 1.2.1: avoid copying or loading the same new script twice within one exec call.
+        for (int j = 0; j < i; j++) {
+            if (strcmp(plans[j].script_name, plans[i].script_name) == 0) {
+                already_planned = j;
+                break;
             }
-            if (starts[i] < 0) starts[i] = idx;
-            ends[i] = idx;
         }
 
-        fclose(p);
-
-        if (starts[i] < 0) {
-            starts[i] = 0;
-            ends[i] = -1;
+        if (already_planned >= 0) {
+            if (plans[already_planned].needs_load) {
+                plans[i].needs_load = 0;
+            }
+            continue;
         }
+
+        // A3 1.2.1: each unique script name is copied into backing_store exactly once.
+        if (mem_copy_script_to_backing_store(scripts[i],
+                                             plans[i].script_name, sizeof(plans[i].script_name),
+                                             plans[i].backing_path, sizeof(plans[i].backing_path)) != 0) {
+            if (print_exec_load_error) {
+                return badcommandExecLoad();
+            }
+            return 1;
+        }
+
+        // A3 1.2.1: eager loading still needs full line count up front to size the page table.
+        plans[i].line_count = mem_count_script_lines(plans[i].backing_path);
+        if (plans[i].line_count < 0) {
+            if (print_exec_load_error) {
+                return badcommandExecLoad();
+            }
+            return 1;
+        }
+
+        // A3 1.2.1: round up so 1-3 lines use 1 page, 4-6 lines use 2 pages, and so on.
+        plans[i].num_pages = (plans[i].line_count + PAGE_SIZE - 1) / PAGE_SIZE;
+        plans[i].needs_load = 1;
+        total_new_pages += plans[i].num_pages;
+    }
+
+    // A3 1.2.1: Task 1 requires enough free frames for all pages before starting the load.
+    if (mem_count_free_frames() < total_new_pages) {
+        if (print_exec_load_error) {
+            return badcommandExecLoad();
+        }
+        return 1;
     }
 
     for (int i = 0; i < script_count; i++) {
-        pcbs[i] = make_pcb(starts[i], ends[i]);
+        int *page_table = NULL;
+        int num_pages = 0;
+
+        if (!plans[i].needs_load) {
+            continue;
+        }
+
+        // A3 1.2.1: load every page from backing_store into a frame now.
+        if (mem_load_script_from_backing_store(plans[i].backing_path, plans[i].script_name,
+                                               plans[i].line_count, &page_table, &num_pages) != 0) {
+            rollback_loaded_scripts(loaded_scripts, loaded_count);
+            if (print_exec_load_error) {
+                return badcommandExecLoad();
+            }
+            return 1;
+        }
+
+        // A3 1.2.1: register the loaded script so duplicate exec can share frames.
+        if (mem_register_script(plans[i].script_name, page_table, num_pages, plans[i].line_count) != 0) {
+            mem_release_frames(page_table, num_pages);
+            free(page_table);
+            rollback_loaded_scripts(loaded_scripts, loaded_count);
+            if (print_exec_load_error) {
+                return badcommandExecLoad();
+            }
+            return 1;
+        }
+
+        // A3 1.2.1: remember enough state to undo this load if a later step fails.
+        loaded_scripts[loaded_count].loaded_now = 1;
+        loaded_scripts[loaded_count].num_pages = num_pages;
+        loaded_scripts[loaded_count].page_table = page_table;
+        snprintf(loaded_scripts[loaded_count].script_name,
+                 sizeof(loaded_scripts[loaded_count].script_name), "%s", plans[i].script_name);
+        loaded_count++;
+    }
+
+    // A3 1.2.1: each PCB keeps a logical PC and its own page-table copy.
+    for (int i = 0; i < script_count; i++) {
+        int *page_table = NULL;
+        int num_pages = 0;
+        int line_count = 0;
+
+        // A3 1.2.1: clone shared page mappings into a per-process page table.
+        if (mem_clone_script_page_table(plans[i].script_name, &page_table, &num_pages, &line_count) != 0) {
+            rollback_loaded_scripts(loaded_scripts, loaded_count);
+            free_planned_pcbs(pcbs, i);
+            if (print_exec_load_error) {
+                return badcommandExecLoad();
+            }
+            return 1;
+        }
+
+        pcbs[i] = make_pcb(plans[i].script_name, line_count, num_pages, page_table);
         if (pcbs[i] == NULL) {
-            for (int j = 0; j < i; j++) {
-                free(pcbs[j]);
-            }
-            for (int j = 0; j < script_count; j++) {
-                mem_cleanup_script(starts[j], ends[j]);
-            }
+            free(page_table);
+            rollback_loaded_scripts(loaded_scripts, loaded_count);
+            free_planned_pcbs(pcbs, i);
             if (print_exec_load_error) {
                 return badcommandExecLoad();
             }
@@ -284,8 +401,12 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
         }
     }
 
-    // For AGING policy, use sorted insertion to order processes by job length
-    // For other policies, use FIFO (add to tail)
+    // A3 1.2.1: the registry keeps its own copy, so these temporary rollback tables can go away.
+    for (int i = 0; i < loaded_count; i++) {
+        free(loaded_scripts[i].page_table);
+        loaded_scripts[i].page_table = NULL;
+    }
+
     for (int i = 0; i < script_count; i++) {
         if (policy == POLICY_AGING) {
             ready_queue_insert_sorted(pcbs[i]);
@@ -294,7 +415,6 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
         }
     }
 
-    // In background mode, use non-blocking scheduler
     if (background_mode) {
         return scheduler_run_background(policy);
     }
@@ -512,11 +632,10 @@ int cd(char *path) {
 }
 
 int source(char *script) {
-    // A2 1.2.1 + 1.2.2: source runs through the same process loader/scheduler path
-    // as exec with one program and FCFS.
-    FILE *p = fopen(script, "rt");
+    // A3 1.2.1: source now enters the same backing-store and frame-loading path as exec.
     char *scripts[1];
 
+    FILE *p = fopen(script, "rt");
     if (p == NULL) {
         return badcommandFileDoesNotExist();
     }
@@ -527,6 +646,7 @@ int source(char *script) {
 }
 
 int exec_cmd(char *args[], int arg_size) {
+    // A3 1.2.1: duplicate script names are allowed now, so only policy/flags are parsed here.
     // Detect background mode (#) and MT option - they can be in any order at the end
     int background_mode = 0;
     int mt_detected = 0;
@@ -554,14 +674,6 @@ int exec_cmd(char *args[], int arg_size) {
 
     if (parse_policy(policy_text, &policy) != 0) {
         return badcommandExecPolicy();
-    }
-
-    for (int i = 0; i < script_count; i++) {
-        for (int j = i + 1; j < script_count; j++) {
-            if (strcmp(args[i], args[j]) == 0) {
-                return badcommandExecDuplicate();
-            }
-        }
     }
 
     // Enable MT only if flag is present in THIS exec

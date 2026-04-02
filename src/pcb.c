@@ -1,22 +1,38 @@
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "pcb.h"
 
-int pid_counter = 0; // global pid counter
+static int pid_counter = 0;
 
-PCB* make_pcb(int start, int end) {
-    // 1.2.1: one PCB per loaded script
-    PCB* new_pcb = (PCB*)malloc(sizeof(PCB));
+PCB* make_pcb(const char *script_name, int job_time, int num_pages, int *page_table) {
+    // A3 1.2.1: each PCB now tracks logical paging state instead of start/end offsets.
+    PCB *new_pcb = malloc(sizeof(PCB));
     if (new_pcb == NULL) {
         fprintf(stderr, "Memory allocation failed for PCB\n");
         return NULL;
     }
-    new_pcb->pid = ++pid_counter; //pre increment to start from 1
-    new_pcb->start = start;
-    new_pcb->end = end;
-    new_pcb->pc = start; // 1.2.1 program counter
-    new_pcb->job_time = (end - start+1); // 1.2.3 SJF uses line count as job length
-    new_pcb->job_length_score = new_pcb->job_time; // (NOT in the video) 1.2.4 AGING score starts = job length
-    new_pcb->next = NULL; // Initialize next pointer to NULL
+
+    // A3 1.2.1: PCB now stores logical paging state instead of start/end indices.
+    new_pcb->pid = ++pid_counter;
+    snprintf(new_pcb->script_name, sizeof(new_pcb->script_name), "%s", script_name);
+    new_pcb->PC = 0;
+    new_pcb->num_pages = num_pages;
+    new_pcb->page_table = page_table;
+    new_pcb->job_time = job_time;
+    new_pcb->job_length_score = job_time;
+    new_pcb->next = NULL;
     return new_pcb;
+}
+
+void free_pcb(PCB *pcb) {
+    // A3 1.2.1: each process owns its page-table copy, so free it with the PCB.
+    if (pcb == NULL) {
+        return;
+    }
+
+    // A3 1.2.1: freeing a process releases its private page-table copy only.
+    free(pcb->page_table);
+    free(pcb);
 }

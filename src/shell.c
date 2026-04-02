@@ -11,7 +11,9 @@ int parseInput(char ui[]);
 
 // Start of everything
 int main(int argc, char *argv[]) {
-    printf("Shell version 1.5 created Dec 2025\n");
+    // A3 1.2.1: print the compile-time split between frame store and variable store.
+    printf("Frame Store Size = %d; Variable Store Size = %d\n",
+           FRAME_STORE_SIZE, VAR_STORE_SIZE);
 
     char prompt = '$';          // Shell prompt
     char userInput[MAX_USER_INPUT];     // user's input stored here
@@ -26,6 +28,8 @@ int main(int argc, char *argv[]) {
 
     //init shell memory
     mem_init();
+    // A3 1.2.1: reset backing_store once at startup before any exec/source commands can run.
+    mem_ensure_backing_store();
     while (1) {
         if (!batch_mode) {
             printf("%c ", prompt);
@@ -120,4 +124,3 @@ int parseInput(char inp[]) {
     }
     return errorCode;
 }
-

@@ -38,18 +38,18 @@ static PCB* scheduler_pop_forced_first_if_any(void);
 // Forward declaration for 1.2.6
 static void* scheduler_worker_thread(void* arg);
 static int run_process_slice(PCB *current, int max_instructions, int last_error);
+static char* get_current_instruction(PCB *current);
 
 static int scheduler_run_fcfs(void) {
-    // 1.2.1 base scheduler behavior. 1.2.2 exec FCFS also lands here
+    // 1.2.1 base scheduler behavior. 1.2.2 exec FCFS also lands here.
+    // A3 1.2.1: process teardown now frees only PCB-owned state.
     int last_error = 0;
     PCB *current = NULL;
 
     while ((current = scheduler_pop_forced_first_if_any()) != NULL
            || (current = ready_queue_pop_head()) != NULL) {
         last_error = run_process_slice(current, -1, last_error);
-
-        mem_cleanup_script(current->start, current->end);
-        free(current);
+        free_pcb(current);
     }
 
     return last_error;
@@ -70,23 +70,50 @@ static PCB* scheduler_pop_forced_first_if_any(void) {
 static int run_process_slice(PCB *current, int max_instructions, int last_error) {
     int executed = 0;
 
-    while (current->pc <= current->end
+    // A3 1.2.1: stop based on logical line count, not physical memory bounds.
+    while (current->PC < current->job_time
            && (max_instructions < 0 || executed < max_instructions)) {
-        char *line = mem_get_line(current->pc);
+        char *line = get_current_instruction(current);
+        // A3 1.2.1: padding is stored as "", and parseInput safely treats that as a no-op.
         if (line != NULL) {
             last_error = parseInput(line);
         }
-        current->pc++;
+        current->PC++;
         executed++;
     }
 
     return last_error;
 }
 
+static char* get_current_instruction(PCB *current) {
+    int page;
+    int offset;
+    int frame;
+
+    // A3 1.2.1: translate logical PC through the page table into the frame store.
+    if (current == NULL || current->PC < 0 || current->PC >= current->job_time) {
+        return NULL;
+    }
+
+    page = current->PC / PAGE_SIZE;
+    offset = current->PC % PAGE_SIZE;
+    if (page < 0 || page >= current->num_pages) {
+        return NULL;
+    }
+
+    frame = current->page_table[page];
+    if (frame < 0) {
+        return NULL;
+    }
+
+    return mem_get_frame_line(frame, offset);
+}
+
 
 
 // 1.2.3: SJF scheduler
 static int scheduler_run_sjf(void) {
+    // A3 1.2.1: SJF ordering stays the same; only instruction fetch/teardown changed.
     int last_error = 0;
     PCB *current = NULL;
 
@@ -94,9 +121,7 @@ static int scheduler_run_sjf(void) {
     while ((current = scheduler_pop_forced_first_if_any()) != NULL
            || (current = ready_queue_pop_shortest()) != NULL) {
         last_error = run_process_slice(current, -1, last_error);
-
-        mem_cleanup_script(current->start, current->end);
-        free(current);
+        free_pcb(current);
     }
 
     return last_error;
@@ -112,9 +137,9 @@ static int scheduler_run_rr_quantum(int quantum) {
            || (current = ready_queue_pop_head()) != NULL) {
         last_error = run_process_slice(current, quantum, last_error);
 
-        if (current->pc > current->end) {
-            mem_cleanup_script(current->start, current->end);
-            free(current);
+        // A3 1.2.1: process exit no longer frees shared frames.
+        if (current->PC >= current->job_time) {
+            free_pcb(current);
         } else {
             ready_queue_add_to_tail(current);
         }
@@ -133,9 +158,9 @@ static int scheduler_run_aging(void) {
            || (current = ready_queue_pop_head()) != NULL) {
         last_error = run_process_slice(current, aging_quantum, last_error);
 
-        if (current->pc > current->end) {
-            mem_cleanup_script(current->start, current->end);
-            free(current);
+        // A3 1.2.1: process exit no longer frees shared frames.
+        if (current->PC >= current->job_time) {
+            free_pcb(current);
             continue;
         }
 
@@ -155,6 +180,7 @@ static int scheduler_run_aging(void) {
 }
 
 static int scheduler_run_mt_rr(int time_slice) {
+    // A3 1.2.1: multithreaded RR still uses the same logical-PC execution path.
     int slice_arg0 = time_slice;
     int slice_arg1 = time_slice;
     
@@ -195,6 +221,7 @@ static int scheduler_run_mt_rr(int time_slice) {
 
 // Non-blocking MT scheduler for background mode
 static int scheduler_run_mt_rr_nonblocking(int time_slice) {
+    // A3 1.2.1: background MT execution still runs against paged PCBs.
     scheduler_quit = 0;  // Reset quit flag
     active_jobs = 0;  // Reset active job count
     // dont set g_scheduler_active = 1 here because its background
@@ -247,6 +274,7 @@ int scheduler_run(SchedulePolicy policy) {
 
 // Background mode scheduler: for MT, starts threads without waiting. For non-MT, returns immediately.
 int scheduler_run_background(SchedulePolicy policy) {
+    // A3 1.2.1: no extra paging logic here; the PCB/frame setup is already done before scheduling.
     if (mt_enabled && (policy == POLICY_RR || policy == POLICY_RR30)) {
         int slice = (policy == POLICY_RR) ? 2 : 30;
         // use local variables, not static array
@@ -297,6 +325,7 @@ void scheduler_join_workers() {
 
 // 1.2.6 Worker thread function for MT RR/RR30
 static void* scheduler_worker_thread(void* arg) {
+    // A3 1.2.1: worker threads execute the same logical-PC/page-table path as single-thread mode.
     int time_slice = (int)(intptr_t)arg;
     
     while (1) {
@@ -326,13 +355,12 @@ static void* scheduler_worker_thread(void* arg) {
         run_process_slice(current, time_slice, 0);
         
         // Check if process is complete
-        int is_done = (current->pc > current->end);
+        // A3 1.2.1: completion is based on logical PC reaching total script lines.
+        int is_done = (current->PC >= current->job_time);
         
         pthread_mutex_lock(&rq_mutex);
         if (is_done) {
-            // Process finished - cleanup
-            mem_cleanup_script(current->start, current->end);
-            free(current);
+            free_pcb(current);
             active_jobs--;
         } else {
             // Process not done - back to queue
