@@ -327,8 +327,18 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
         total_new_pages += plans[i].num_pages;
     }
 
-    // A3 1.2.1: Task 1 requires enough free frames for all pages before starting the load.
-    if (mem_count_free_frames() < total_new_pages) {
+    // A3 1.2.2: demand paging only requires 1-2 frames per script, not all pages upfront.
+    // Check that we can load at least the initial pages.
+    int total_initial_pages = 0;
+    for (int i = 0; i < script_count; i++) {
+        if (plans[i].needs_load) {
+            // Each script needs 1-2 pages initially
+            int initial = (plans[i].line_count >= PAGE_SIZE) ? 2 : 1;
+            total_initial_pages += initial;
+        }
+    }
+
+    if (mem_count_free_frames() < total_initial_pages) {
         if (print_exec_load_error) {
             return badcommandExecLoad();
         }
@@ -343,9 +353,9 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
             continue;
         }
 
-        // A3 1.2.1: load every page from backing_store into a frame now.
-        if (mem_load_script_from_backing_store(plans[i].backing_path, plans[i].script_name,
-                                               plans[i].line_count, &page_table, &num_pages) != 0) {
+        // A3 1.2.2: load only the first 1-2 pages (demand paging).
+        if (mem_load_initial_pages(plans[i].backing_path, plans[i].script_name,
+                                    plans[i].line_count, &page_table, &num_pages) != 0) {
             rollback_loaded_scripts(loaded_scripts, loaded_count);
             if (print_exec_load_error) {
                 return badcommandExecLoad();
@@ -399,6 +409,9 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
             }
             return 1;
         }
+        
+        // A3 1.2.2: store backing path for demand paging.
+        snprintf(pcbs[i]->backing_path, sizeof(pcbs[i]->backing_path), "%s", plans[i].backing_path);
     }
 
     // A3 1.2.1: the registry keeps its own copy, so these temporary rollback tables can go away.
