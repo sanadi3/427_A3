@@ -28,6 +28,9 @@ static FrameEntry frame_table[MAX_FRAMES];
 // A3 1.2.1: remember loaded scripts so duplicate exec shares frames.
 static LoadedScriptEntry loaded_scripts[MAX_FRAMES];
 
+// A3 1.2.2: global clock for LRU (Least Recently Used) page replacement
+static unsigned long clock_value = 0;
+
 static int clone_page_table(const int *src, int num_pages, int **out_copy) {
     // A3 1.2.1: duplicate a shared script mapping so each PCB gets its own table object.
     if (num_pages <= 0) {
@@ -163,12 +166,14 @@ static int mem_update_page_table_for_evicted_frame(int victim_frame) {
 }
 
 static int mem_evict_random_frame(void) {
-    // A3 1.2.2: evict the first occupied frame (FIFO policy for predictable behavior)
+    // A3 1.2.2: evict the least recently used (LRU) occupied frame
     int victim = -1;
+    unsigned long min_last_used = (unsigned long)-1;
+    
     for (int i = 0; i < MAX_FRAMES; i++) {
-        if (frame_table[i].occupied) {
+        if (frame_table[i].occupied && frame_table[i].last_used < min_last_used) {
             victim = i;
-            break;
+            min_last_used = frame_table[i].last_used;
         }
     }
 
@@ -395,7 +400,7 @@ int mem_load_script_from_backing_store(const char *backing_path, const char *scr
         page_table[page] = frame;
         frame_table[frame].occupied = 1;
         frame_table[frame].page_num = page;
-        frame_table[frame].last_used = 0;
+        frame_table[frame].last_used = clock_value++;
         snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
 
         // A3 1.2.1: each frame always holds exactly three line slots.
@@ -472,7 +477,7 @@ int mem_load_initial_pages(const char *backing_path, const char *script_name,
         page_table[page] = frame;
         frame_table[frame].occupied = 1;
         frame_table[frame].page_num = page;
-        frame_table[frame].last_used = 0;
+        frame_table[frame].last_used = clock_value++;
         snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
 
         // Load PAGE_SIZE lines into the frame
@@ -565,7 +570,7 @@ int mem_demand_load_page(int *page_table, int page_num, const char *backing_path
     page_table[page_num] = frame;
     frame_table[frame].occupied = 1;
     frame_table[frame].page_num = page_num;
-    frame_table[frame].last_used = 0;
+    frame_table[frame].last_used = clock_value++;
     snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
 
     for (int offset = 0; offset < PAGE_SIZE; offset++) {
@@ -666,6 +671,11 @@ char *mem_get_frame_line(int frame, int offset) {
     // A3 1.2.1: scheduler fetches instructions through this physical frame lookup.
     if (frame < 0 || frame >= MAX_FRAMES || offset < 0 || offset >= PAGE_SIZE) {
         return NULL;
+    }
+
+    // A3 1.2.2: update LRU timestamp on frame access
+    if (frame_table[frame].occupied) {
+        frame_table[frame].last_used = clock_value++;
     }
 
     return frame_store[physical_index];
