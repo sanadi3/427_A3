@@ -5,6 +5,8 @@ typedef struct PCB {
     int pid;
     // A3 1.2.1: logical execution state for paging.
     char script_name[256];
+    // A3 1.2.2: backing store path for demand paging.
+    char backing_path[512];
     int PC;
     int num_pages;
     int *page_table;
