@@ -89,6 +89,107 @@ static void clear_frame(int frame) {
     frame_table[frame].script_name[0] = '\0';
     frame_table[frame].page_num = -1;
     frame_table[frame].last_used = 0;
+    frame_table[frame].num_using = 0;
+}
+
+static int mem_register_pcb_uses_frame(int frame, int pcb_pid) {
+    // A3 1.2.2: register that a PCB uses this frame
+    if (frame < 0 || frame >= MAX_FRAMES) {
+        return 1;
+    }
+
+    // Check if already registered
+    for (int i = 0; i < frame_table[frame].num_using; i++) {
+        if (frame_table[frame].using_pcb_pids[i] == pcb_pid) {
+            return 0;  // Already registered
+        }
+    }
+
+    // Add to list if space available
+    if (frame_table[frame].num_using >= MAX_PROCESSES) {
+        return 1;  // No space
+    }
+
+    frame_table[frame].using_pcb_pids[frame_table[frame].num_using] = pcb_pid;
+    frame_table[frame].num_using++;
+    return 0;
+}
+
+static int mem_unregister_pcb_from_frame(int frame, int pcb_pid) {
+    // A3 1.2.2: unregister that a PCB uses this frame
+    if (frame < 0 || frame >= MAX_FRAMES) {
+        return 1;
+    }
+
+    for (int i = 0; i < frame_table[frame].num_using; i++) {
+        if (frame_table[frame].using_pcb_pids[i] == pcb_pid) {
+            // Remove by shifting
+            for (int j = i; j < frame_table[frame].num_using - 1; j++) {
+                frame_table[frame].using_pcb_pids[j] = frame_table[frame].using_pcb_pids[j + 1];
+            }
+            frame_table[frame].num_using--;
+            return 0;
+        }
+    }
+
+    return 0;  // Not found, but not an error
+}
+
+static int mem_update_page_table_for_evicted_frame(int victim_frame) {
+    // A3 1.2.2: update all page tables that referenced the evicted frame
+    char victim_script[256];
+    int victim_page;
+
+    strcpy(victim_script, frame_table[victim_frame].script_name);
+    victim_page = frame_table[victim_frame].page_num;
+
+    // Find all loaded scripts that use this script name
+    for (int script_idx = 0; script_idx < MAX_FRAMES; script_idx++) {
+        if (!loaded_scripts[script_idx].in_use) {
+            continue;
+        }
+
+        if (strcmp(loaded_scripts[script_idx].script_name, victim_script) != 0) {
+            continue;
+        }
+
+        // Found a loaded script with this name, mark the page as not loaded
+        if (victim_page >= 0 && victim_page < loaded_scripts[script_idx].num_pages) {
+            loaded_scripts[script_idx].page_table[victim_page] = -1;
+        }
+    }
+
+    return 0;
+}
+
+static int mem_evict_random_frame(void) {
+    // A3 1.2.2: evict the first occupied frame (FIFO policy for predictable behavior)
+    int victim = -1;
+    for (int i = 0; i < MAX_FRAMES; i++) {
+        if (frame_table[i].occupied) {
+            victim = i;
+            break;
+        }
+    }
+
+    if (victim < 0) {
+        return -1;  // No frame to evict
+    }
+
+    // Print victim page contents header and contents (frame store was full)
+    printf("Page fault! Victim page contents:\n\n");
+    int base = victim * PAGE_SIZE;
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        if (frame_store[base + i] != NULL) {
+            printf("%s", frame_store[base + i]);
+        }
+    }
+    printf("\nEnd of victim page contents.\n");
+
+    // Clear the victim frame
+    clear_frame(victim);
+
+    return victim;
 }
 
 void mem_init(void) {
@@ -109,6 +210,11 @@ void mem_init(void) {
         frame_table[i].script_name[0] = '\0';
         frame_table[i].page_num = -1;
         frame_table[i].last_used = 0;
+        // A3 1.2.2: initialize PCB tracking
+        frame_table[i].num_using = 0;
+        for (int j = 0; j < MAX_PROCESSES; j++) {
+            frame_table[i].using_pcb_pids[j] = -1;
+        }
 
         loaded_scripts[i].in_use = 0;
         loaded_scripts[i].script_name[0] = '\0';
@@ -317,6 +423,175 @@ int mem_load_script_from_backing_store(const char *backing_path, const char *scr
     fclose(script);
     *page_table_out = page_table;
     return 0;
+}
+
+int mem_load_initial_pages(const char *backing_path, const char *script_name,
+                           int total_lines, int **page_table_out, int *num_pages_out) {
+    // A3 1.2.2: demand paging - load only first 1-2 pages initially.
+    FILE *script = NULL;
+    int *page_table = NULL;
+    // Total number of pages (including future pages not yet loaded)
+    int num_pages = (total_lines + PAGE_SIZE - 1) / PAGE_SIZE;
+    // Pages to load initially: 2 if enough lines, else 1
+    int pages_to_load = (total_lines >= PAGE_SIZE) ? 2 : 1;
+    char line[1000];
+
+    *page_table_out = NULL;
+    *num_pages_out = num_pages;
+
+    if (num_pages == 0) {
+        return 0;
+    }
+
+    script = fopen(backing_path, "rt");
+    if (script == NULL) {
+        return 1;
+    }
+
+    page_table = malloc((size_t)num_pages * sizeof(int));
+    if (page_table == NULL) {
+        fclose(script);
+        return 1;
+    }
+
+    // Initialize all pages to -1 (not loaded)
+    for (int i = 0; i < num_pages; i++) {
+        page_table[i] = -1;
+    }
+
+    // A3 1.2.2: load only the first pages_to_load pages.
+    for (int page = 0; page < pages_to_load && page < num_pages; page++) {
+        int frame = find_free_frame();
+        if (frame < 0) {
+            fclose(script);
+            mem_release_frames(page_table, page);
+            free(page_table);
+            return 1;
+        }
+
+        page_table[page] = frame;
+        frame_table[frame].occupied = 1;
+        frame_table[frame].page_num = page;
+        frame_table[frame].last_used = 0;
+        snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
+
+        // Load PAGE_SIZE lines into the frame
+        for (int offset = 0; offset < PAGE_SIZE; offset++) {
+            int physical_index = frame * PAGE_SIZE + offset;
+            char *stored_line = NULL;
+
+            if (fgets(line, sizeof(line), script) != NULL) {
+                stored_line = strdup(line);
+            } else {
+                stored_line = strdup("");
+            }
+
+            if (stored_line == NULL) {
+                fclose(script);
+                mem_release_frames(page_table, page + 1);
+                free(page_table);
+                return 1;
+            }
+
+            frame_store[physical_index] = stored_line;
+        }
+    }
+
+    // If we loaded fewer than all pages, seek to end of initial loaded content
+    // This prepares for demand loading the rest later
+    for (int remaining = pages_to_load * PAGE_SIZE; remaining < total_lines; remaining++) {
+        if (fgets(line, sizeof(line), script) == NULL) {
+            break;
+        }
+    }
+
+    fclose(script);
+    *page_table_out = page_table;
+    return 0;
+}
+
+int mem_demand_load_page(int *page_table, int page_num, const char *backing_path,
+                         const char *script_name, int total_lines) {
+    // A3 1.2.2: load a specific page on demand when accessed.
+    // Returns: 0 = success, 1 = page fault (had to evict), 2 = error
+    FILE *script = NULL;
+    int frame = -1;
+    int num_pages = (total_lines + PAGE_SIZE - 1) / PAGE_SIZE;
+    char line[1000];
+    int had_to_evict = 0;
+
+    // Sanity checks
+    if (page_num < 0 || page_num >= num_pages) {
+        return 2;
+    }
+
+    // Already loaded?
+    if (page_table[page_num] >= 0) {
+        return 0;
+    }
+
+    // Find a free frame
+    frame = find_free_frame();
+    if (frame < 0) {
+        // A3 1.2.2: no free frame, evict a random one - prints "Page fault! Victim..." 
+        frame = mem_evict_random_frame();
+        if (frame < 0) {
+            return 2;  // Error - eviction failed
+        }
+        
+        // Update the page table of the evicted script to mark page as not loaded
+        mem_update_page_table_for_evicted_frame(frame);
+        had_to_evict = 1;
+    } else {
+        // A3 1.2.2: page fault without needing eviction (frame store not full)
+        printf("Page fault!\n");
+    }
+
+    script = fopen(backing_path, "rt");
+    if (script == NULL) {
+        return 2;
+    }
+
+    // Seek to the start of the page
+    int line_to_read = page_num * PAGE_SIZE;
+    for (int i = 0; i < line_to_read; i++) {
+        if (fgets(line, sizeof(line), script) == NULL) {
+            fclose(script);
+            return 2;
+        }
+    }
+
+    // Load this page into the frame
+    page_table[page_num] = frame;
+    frame_table[frame].occupied = 1;
+    frame_table[frame].page_num = page_num;
+    frame_table[frame].last_used = 0;
+    snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
+
+    for (int offset = 0; offset < PAGE_SIZE; offset++) {
+        int physical_index = frame * PAGE_SIZE + offset;
+        char *stored_line = NULL;
+
+        if (fgets(line, sizeof(line), script) != NULL) {
+            stored_line = strdup(line);
+        } else {
+            stored_line = strdup("");
+        }
+
+        if (stored_line == NULL) {
+            fclose(script);
+            clear_frame(frame);
+            page_table[page_num] = -1;
+            return 2;
+        }
+
+        frame_store[physical_index] = stored_line;
+    }
+
+    fclose(script);
+    
+    // Return 1 if we had to evict (process should be interrupted for page fault)
+    return had_to_evict ? 1 : 0;
 }
 
 int mem_register_script(const char *script_name, const int *page_table, int num_pages, int line_count) {
