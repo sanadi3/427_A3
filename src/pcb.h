@@ -3,9 +3,10 @@
 
 typedef struct PCB {
     int pid;
-    // A3 1.2.1: logical execution state for paging.
+    /* 1.2.1: A2 tracked physical start/end positions in shell memory. Paging
+       replaces that with a script identity plus logical execution state. */
     char script_name[256];
-    // A3 1.2.2: backing store path for demand paging.
+    // 1.2.2: later page faults reopen this backing-store copy to fetch missing pages.
     char backing_path[512];
     int PC;
     int num_pages;

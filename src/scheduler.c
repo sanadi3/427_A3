@@ -1,9 +1,5 @@
 #include <stdlib.h>
 #include <stdio.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <errno.h>
-#include <stdint.h>
 
 #include "scheduler.h"
 #include "shellmemory.h"
@@ -11,32 +7,6 @@
 #include "shell.h"
 
 static int g_scheduler_active = 0;
-static SchedulePolicy g_current_policy = POLICY_FCFS;
-static int g_force_first_pid_once = -1;
-
-// Multithreaded scheduler globals
-static int mt_enabled = 0;
-static pthread_t worker_threads[2];
-static pthread_mutex_t rq_mutex = PTHREAD_MUTEX_INITIALIZER;  // Queue mutex
-static pthread_cond_t rq_cond = PTHREAD_COND_INITIALIZER;  // Condition variable
-static int scheduler_quit = 0;
-static int active_jobs = 0;  // Count of jobs currently being executed
-// Note: for the fcfs function in the video, please see line 41 onwards
-
-// Background globals
-static int background_jobs_active = 0;
-static pthread_mutex_t bg_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/*
- * 1.2.5 background-mode fix (for T_background):
- * Before this, SJF could pick a shorter user program before the batch-script process.
- * Assignment says batch script must run first once.
- * So we keep one "forced first PID" and pop that process first exactly one time.
- * After that, scheduling goes back to normal FCFS/SJF/RR/RR30/AGING behavior.
- */
-static PCB* scheduler_pop_forced_first_if_any(void);
-// Forward declaration for 1.2.6
-static void* scheduler_worker_thread(void* arg);
 static int run_process_slice(PCB *current, int max_instructions, int last_error);
 static char* get_current_instruction(PCB *current);
 
@@ -47,8 +17,7 @@ static int scheduler_run_fcfs(void) {
     int last_error = 0;
     PCB *current = NULL;
 
-    while ((current = scheduler_pop_forced_first_if_any()) != NULL
-           || (current = ready_queue_pop_head()) != NULL) {
+    while ((current = ready_queue_pop_head()) != NULL) {
         last_error = run_process_slice(current, -1, last_error);
         
         // A3 1.2.2: if process hit a page fault and still has work, re-enqueue it
@@ -61,20 +30,16 @@ static int scheduler_run_fcfs(void) {
 
     return last_error;
 }
-
-// Pop forced-first process if any
-static PCB* scheduler_pop_forced_first_if_any(void) {
-    PCB *forced = NULL;
-    if (g_force_first_pid_once < 0) {
-        return NULL;
-    }
-    forced = ready_queue_pop_pid(g_force_first_pid_once);
-    g_force_first_pid_once = -1;
-    return forced;
-}
-
 // 1.2.3 helper. also reused by 1.2.4 aging loop
 static int run_process_slice(PCB *current, int max_instructions, int last_error) {
+    /* 
+     1.2.2 — Demand Paging: Fault Detection During Execution
+     * The scheduler does not pre-check all needed pages. It tries to fetch the
+     * current instruction, and if translation fails because the page-table
+     * entry is still -1, this loop triggers demand loading. The important part
+     * is that we break before PC++ on a fault, so the process retries the same
+     * logical instruction when it runs again.
+    */
     int executed = 0;
 
     // A3 1.2.1: stop based on logical line count, not physical memory bounds.
@@ -82,7 +47,7 @@ static int run_process_slice(PCB *current, int max_instructions, int last_error)
            && (max_instructions < 0 || executed < max_instructions)) {
         char *line = get_current_instruction(current);
         
-        // A3 1.2.2: if page not loaded, try demand loading
+        // NULL here means "cannot fetch this logical line right now", which is the page-fault signal.
         if (line == NULL && current->backing_path[0] != '\0') {
             int page = current->PC / PAGE_SIZE;
             if (page >= 0 && page < current->num_pages && current->page_table[page] < 0) {
@@ -90,8 +55,7 @@ static int run_process_slice(PCB *current, int max_instructions, int last_error)
                 int load_result = mem_demand_load_page(current->page_table, page, current->backing_path,
                                                         current->script_name, current->job_time);
                 if (load_result == 0 || load_result == 1) {
-                    // A3 1.2.2: any page fault (with or without eviction) interrupts execution
-                    // Process is placed back at end of ready queue by scheduler
+                    // Stop the slice immediately so the ready-queue policy decides when this process retries.
                     break;
                 }
                 // load_result == 2 is an error, just continue (line stays NULL)
@@ -110,6 +74,14 @@ static int run_process_slice(PCB *current, int max_instructions, int last_error)
 }
 
 static char* get_current_instruction(PCB *current) {
+    /*
+     * 1.2.1 / 1.2.2 — Logical-to-Physical Translation
+     * PC counts logical script lines, not physical memory slots. We translate
+     * PC into (page, offset), look up the frame in the page table, and then ask
+     * shellmemory for that physical line. If the page-table entry is -1, we
+     * return NULL instead of forcing a load here so the scheduler can treat the
+     * miss as a page fault and preserve the current instruction.
+    */
     int page;
     int offset;
     int frame;
@@ -119,6 +91,8 @@ static char* get_current_instruction(PCB *current) {
         return NULL;
     }
 
+    /* PC / PAGE_SIZE gives the logical page number.
+       PC % PAGE_SIZE gives the line offset inside that page. */
     page = current->PC / PAGE_SIZE;
     offset = current->PC % PAGE_SIZE;
     if (page < 0 || page >= current->num_pages) {
@@ -141,24 +115,25 @@ static int scheduler_run_sjf(void) {
     int last_error = 0;
     PCB *current = NULL;
 
-    // Get next process - try forced first, then shortest job
-    while ((current = scheduler_pop_forced_first_if_any()) != NULL
-           || (current = ready_queue_pop_shortest()) != NULL) {
+    while ((current = ready_queue_pop_shortest()) != NULL) {
         last_error = run_process_slice(current, -1, last_error);
-        free_pcb(current);
+
+        if (current->PC < current->job_time) {
+            ready_queue_add_to_tail(current);
+        } else {
+            free_pcb(current);
+        }
     }
 
     return last_error;
 }
 
-// 1.2.3 + 1.2.5: RR core with configurable quantum (2 for RR, 30 for RR30)
+// 1.2.3 + 1.2.5: RR core with configurable quanta (2 for RR, 30 for RR30)
 static int scheduler_run_rr_quantum(int quantum) {
     int last_error = 0;
     PCB *current = NULL;
 
-    // Get next process - try forced first, then head of queue
-    while ((current = scheduler_pop_forced_first_if_any()) != NULL
-           || (current = ready_queue_pop_head()) != NULL) {
+    while ((current = ready_queue_pop_head()) != NULL) {
         last_error = run_process_slice(current, quantum, last_error);
 
         // A3 1.2.1: process exit no longer frees shared frames.
@@ -178,8 +153,7 @@ static int scheduler_run_aging(void) {
     PCB *current = NULL;
     const int aging_quantum = 1;
 
-    while ((current = scheduler_pop_forced_first_if_any()) != NULL
-           || (current = ready_queue_pop_head()) != NULL) {
+    while ((current = ready_queue_pop_head()) != NULL) {
         last_error = run_process_slice(current, aging_quantum, last_error);
 
         // A3 1.2.1: process exit no longer frees shared frames.
@@ -203,74 +177,14 @@ static int scheduler_run_aging(void) {
     return last_error;
 }
 
-static int scheduler_run_mt_rr(int time_slice) {
-    // A3 1.2.1: multithreaded RR still uses the same logical-PC execution path.
-    int slice_arg0 = time_slice;
-    int slice_arg1 = time_slice;
-    
-    scheduler_quit = 0;  // Reset quit flag
-    active_jobs = 0;  // Reset active job count
-    
-    pthread_create(&worker_threads[0], NULL, scheduler_worker_thread, &slice_arg0);
-    pthread_create(&worker_threads[1], NULL, scheduler_worker_thread, &slice_arg1);
-    
-    // Wait for all jobs to complete
-    while (1) {
-        pthread_mutex_lock(&rq_mutex);
-        int queue_empty = ready_queue_is_empty();
-        int jobs_active = active_jobs;
-        int should_quit = scheduler_quit;
-        pthread_mutex_unlock(&rq_mutex);
-        
-        // If queue is empty and no jobs are being executed, we're done
-        if (queue_empty && jobs_active == 0) {
-            break;
-        }
-        usleep(1000);
-    }
-    
-    // Tell threads to quit
-    pthread_mutex_lock(&rq_mutex);
-    scheduler_quit = 1;
-    pthread_cond_broadcast(&rq_cond);  // Wake any waiting threads
-    pthread_mutex_unlock(&rq_mutex);
-    
-    // Wait for threads to finish
-    pthread_join(worker_threads[0], NULL); 
-    pthread_join(worker_threads[1], NULL);
-    
-    return 0;
-}
-
-
-// Non-blocking MT scheduler for background mode
-static int scheduler_run_mt_rr_nonblocking(int time_slice) {
-    // A3 1.2.1: background MT execution still runs against paged PCBs.
-    scheduler_quit = 0;  // Reset quit flag
-    active_jobs = 0;  // Reset active job count
-    // dont set g_scheduler_active = 1 here because its background
-    pthread_create(&worker_threads[0], NULL, scheduler_worker_thread, (void*)(intptr_t)time_slice);
-    pthread_create(&worker_threads[1], NULL, scheduler_worker_thread, (void*)(intptr_t)time_slice);
-    
-    return 0;
-}
-
 int scheduler_run(SchedulePolicy policy) {
     int rc = 1;
 
-    // Check for MT mode with RR/RR30 policies
-    if (mt_enabled && (policy == POLICY_RR || policy == POLICY_RR30)) {
-        int slice = (policy == POLICY_RR) ? 2 : 30;
-        return scheduler_run_mt_rr(slice);
-    }
-    // 1.2.5: avoid nested scheduler loops
     if (g_scheduler_active) {
         return 1;
     }
     g_scheduler_active = 1;
-    g_current_policy = policy;
 
-    // 1.2.2 policy dispatch entrypoint used by exec/source path
     switch (policy) {
     case POLICY_FCFS:
         rc = scheduler_run_fcfs();
@@ -294,113 +208,4 @@ int scheduler_run(SchedulePolicy policy) {
 
     g_scheduler_active = 0;
     return rc;
-}
-
-// Background mode scheduler: for MT, starts threads without waiting. For non-MT, returns immediately.
-int scheduler_run_background(SchedulePolicy policy) {
-    // A3 1.2.1: no extra paging logic here; the PCB/frame setup is already done before scheduling.
-    if (mt_enabled && (policy == POLICY_RR || policy == POLICY_RR30)) {
-        int slice = (policy == POLICY_RR) ? 2 : 30;
-        // use local variables, not static array
-        return scheduler_run_mt_rr_nonblocking(slice);
-    }
-    return 0;
-}
-
-int scheduler_is_active(void) {
-    // In background mode, check if there are active jobs or non-empty queue
-    if (mt_enabled) {
-        pthread_mutex_lock(&rq_mutex);
-        int has_work = (active_jobs > 0 || !ready_queue_is_empty());
-        pthread_mutex_unlock(&rq_mutex);
-        return has_work;
-    }
-    return g_scheduler_active;
-}
-
-SchedulePolicy scheduler_get_current_policy(void) {
-    return g_current_policy;
-}
-
-void scheduler_set_first_process_pid(int pid) {
-    g_force_first_pid_once = pid;
-}
-
-void scheduler_enable_multithreaded() {
-    mt_enabled = 1;
-}
-
-void scheduler_disable_multithreaded() {
-    mt_enabled = 0;
-}
-
-int scheduler_is_multithreaded() {
-    return mt_enabled;
-}
-
-// Wait for worker threads to finish (called on quit)
-void scheduler_join_workers() {
-    if (!mt_enabled) return;
-    scheduler_quit = 1;
-    pthread_cond_broadcast(&rq_cond);
-    pthread_join(worker_threads[0], NULL);
-    pthread_join(worker_threads[1], NULL);
-}
-
-// 1.2.6 Worker thread function for MT RR/RR30
-static void* scheduler_worker_thread(void* arg) {
-    // A3 1.2.1: worker threads execute the same logical-PC/page-table path as single-thread mode.
-    int time_slice = (int)(intptr_t)arg;
-    
-    while (1) {
-        pthread_mutex_lock(&rq_mutex);
-        
-        // Wait for work - but check quit condition properly
-        while (!scheduler_quit && ready_queue_is_empty()) {
-            pthread_cond_wait(&rq_cond, &rq_mutex);
-        }
-        
-        // Check if we should quit (queue might be empty)
-        if (scheduler_quit && ready_queue_is_empty()) {
-            pthread_mutex_unlock(&rq_mutex);
-            break;
-        }
-        
-        // Get a process to run
-        PCB *current = ready_queue_pop_head();
-        if (current) {
-            active_jobs++;
-        }
-        pthread_mutex_unlock(&rq_mutex);
-        
-        if (!current) continue;
-        
-        // Run the process slice
-        run_process_slice(current, time_slice, 0);
-        
-        // Check if process is complete
-        // A3 1.2.1: completion is based on logical PC reaching total script lines.
-        int is_done = (current->PC >= current->job_time);
-        
-        pthread_mutex_lock(&rq_mutex);
-        if (is_done) {
-            free_pcb(current);
-            active_jobs--;
-        } else {
-            // Process not done - back to queue
-            ready_queue_add_to_tail(current);
-            active_jobs--;
-        }
-        
-        // Signal that queue state has changed
-        pthread_cond_signal(&rq_cond);
-        pthread_mutex_unlock(&rq_mutex);
-    }
-
-    // When thread exits (all jobs done)
-    pthread_mutex_lock(&bg_mutex);
-    background_jobs_active--;
-    pthread_mutex_unlock(&bg_mutex);
-    
-    return NULL;
 }

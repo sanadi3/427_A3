@@ -22,7 +22,7 @@ typedef struct FrameEntry {
     int occupied;
     char script_name[256];
     int page_num;
-    int last_used;
+    unsigned long last_used;
     // A3 1.2.2: track which processes reference this frame
     int using_pcb_pids[MAX_PROCESSES];
     int num_using;
@@ -49,6 +49,8 @@ int mem_demand_load_page(int *page_table, int page_num, const char *backing_path
                          const char *script_name, int total_lines);
 int mem_register_script(const char *script_name, const int *page_table, int num_pages, int line_count);
 void mem_unregister_script(const char *script_name);
+int mem_register_pcb(PCB *pcb);
+void mem_unregister_pcb(PCB *pcb);
 void mem_release_frames(const int *page_table, int num_pages);
 char *mem_get_frame_line(int frame, int offset);
 

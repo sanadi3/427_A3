@@ -65,7 +65,7 @@ int badcommandExecPolicy();
 int badcommandExecDuplicate();
 int badcommandExecLoad();
 int parse_policy(char *policy_text, SchedulePolicy *out_policy);
-int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy policy, int print_exec_load_error, int background_mode);
+int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy policy, int print_exec_load_error);
 
 typedef struct ScriptPlan {
     char script_name[256];
@@ -264,8 +264,16 @@ static void free_planned_pcbs(PCB *pcbs[], int count) {
     }
 }
 
-int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy policy, int print_exec_load_error, int background_mode) {
-    // A3 1.2.1: copy scripts into backing_store and plan eager page loading.
+int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy policy, int print_exec_load_error) {
+    /*
+     * 1.2.1 / 1.2.2: Program Load Planning and Shared-Script Setup:
+     * exec/source first normalizes every script through backing_store so later
+     * faults can reopen a stable copy from disk. Then we decide which script
+     * names are already in, which ones still need an initial load, and
+     * finally build one PCB per requested program with its own cloned page
+     * table. Shared frames happen at the script level; independent execution
+     * state happens at the PCB level.                                          
+     */
     ScriptPlan plans[3] = { 0 };
     LoadedScriptRollback loaded_scripts[3] = { 0 };
     PCB *pcbs[3] = { NULL, NULL, NULL };
@@ -282,12 +290,12 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
             return 1;
         }
 
-        // A3 1.2.1: if the script is already loaded, later PCBs will reuse its frames.
+        // Duplicate script names are legal now, so an already loaded script skips reloading.
         if (mem_is_script_loaded(plans[i].script_name)) {
             continue;
         }
 
-        // A3 1.2.1: avoid copying or loading the same new script twice within one exec call.
+        // "exec prog1 prog1 RR" should still copy/load the script only once for this command.
         for (int j = 0; j < i; j++) {
             if (strcmp(plans[j].script_name, plans[i].script_name) == 0) {
                 already_planned = j;
@@ -327,12 +335,11 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
         total_new_pages += plans[i].num_pages;
     }
 
-    // A3 1.2.2: demand paging only requires 1-2 frames per script, not all pages upfront.
-    // Check that we can load at least the initial pages.
+    // Demand paging changes the admission test: we only need enough space for the initial resident pages.
     int total_initial_pages = 0;
     for (int i = 0; i < script_count; i++) {
         if (plans[i].needs_load) {
-            // Each script needs 1-2 pages initially
+            // Startup resident set is 1 page for tiny scripts, otherwise the first 2 pages.
             int initial = (plans[i].line_count >= PAGE_SIZE) ? 2 : 1;
             total_initial_pages += initial;
         }
@@ -389,7 +396,7 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
         int num_pages = 0;
         int line_count = 0;
 
-        // A3 1.2.1: clone shared page mappings into a per-process page table.
+        // The clone is important: processes share frames, but they do not share one mutable page-table array.
         if (mem_clone_script_page_table(plans[i].script_name, &page_table, &num_pages, &line_count) != 0) {
             rollback_loaded_scripts(loaded_scripts, loaded_count);
             free_planned_pcbs(pcbs, i);
@@ -428,25 +435,11 @@ int load_and_schedule_programs(char *scripts[], int script_count, SchedulePolicy
         }
     }
 
-    if (background_mode) {
-        return scheduler_run_background(policy);
-    }
-
     return scheduler_run(policy);
 }
 
 int quit() {
     printf("Bye!\n");
-    
-    // For background mode, we need to wait for threads to finish
-    // The scheduler_quit flag will be set when all jobs are done
-    if (scheduler_is_multithreaded()) {
-        // Give threads time to finish
-        while (scheduler_is_active()) {
-            usleep(10000);  // Wait 10ms
-        }
-        scheduler_join_workers();
-    }
     exit(0);
 }
 
@@ -655,28 +648,11 @@ int source(char *script) {
     fclose(p);
 
     scripts[0] = script;
-    return load_and_schedule_programs(scripts, 1, POLICY_FCFS, 0, 0);
+    return load_and_schedule_programs(scripts, 1, POLICY_FCFS, 0);
 }
 
 int exec_cmd(char *args[], int arg_size) {
-    // A3 1.2.1: duplicate script names are allowed now, so only policy/flags are parsed here.
-    // Detect background mode (#) and MT option - they can be in any order at the end
-    int background_mode = 0;
-    int mt_detected = 0;
-    
-    // Strip both # and MT flags from the end, in any order
-    while (arg_size > 0) {
-        if (strcmp(args[arg_size-1], "MT") == 0) {
-            mt_detected = 1;
-            arg_size--;
-        } else if (strcmp(args[arg_size-1], "#") == 0) {
-            background_mode = 1;
-            arg_size--;
-        } else {
-            break;
-        }
-    }
-    
+    // A3 1.2.1: duplicate script names are allowed now, so only script count and policy are parsed here.
     int script_count = arg_size - 1;
     char *policy_text = args[arg_size - 1];
     SchedulePolicy policy;
@@ -689,14 +665,7 @@ int exec_cmd(char *args[], int arg_size) {
         return badcommandExecPolicy();
     }
 
-    // Enable MT only if flag is present in THIS exec
-    if (mt_detected) {
-        scheduler_enable_multithreaded();
-    } else {
-        scheduler_disable_multithreaded();
-    }
-
-    return load_and_schedule_programs(args, script_count, policy, 1, background_mode);
+    return load_and_schedule_programs(args, script_count, policy, 1);
 }
 
 int run(char *args[], int arg_size) {

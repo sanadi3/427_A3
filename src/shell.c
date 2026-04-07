@@ -76,21 +76,13 @@ int parseInput(char inp[]) {
         // skip white spaces
         for (; isspace(inp[ix]) && inp[ix] != '\n' && ix < 1000; ix++);
 
-        // If the next character is a hash (#), add it as a token then continue
-        if (inp[ix] == '#') {
-            words[w] = strdup("#");
-            w++;
-            ix++;
-            continue;
-        }
-
         // If the next character is a semicolon,
         // we should run what we have so far.
         if (inp[ix] == ';')
             break;
 
         // extract a word
-        for (wordlen = 0; !wordEnding(inp[ix]) && inp[ix] != '#' && ix < 1000; ix++, wordlen++) {
+        for (wordlen = 0; !wordEnding(inp[ix]) && ix < 1000; ix++, wordlen++) {
             tmp[wordlen] = inp[ix];
         }
 

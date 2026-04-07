@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 
 #include "shellmemory.h"
+#include "pcb.h"
 
 typedef struct memory_struct {
     char *var;
@@ -20,15 +21,33 @@ typedef struct loaded_script_struct {
     int *page_table;
 } LoadedScriptEntry;
 
-static MemoryEntry variable_store[VAR_STORE_SIZE];
-// A3 1.2.1: frame store replaces the old flat script-memory array.
-static char *frame_store[FRAME_STORE_SIZE];
-// A3 1.2.1: track which script/page occupies each frame.
-static FrameEntry frame_table[MAX_FRAMES];
-// A3 1.2.1: remember loaded scripts so duplicate exec shares frames.
-static LoadedScriptEntry loaded_scripts[MAX_FRAMES];
+typedef struct pcb_registry_node {
+    PCB *pcb;
+    struct pcb_registry_node *next;
+} PcbRegistryNode;
 
-// A3 1.2.2: global clock for LRU (Least Recently Used) page replacement
+/* 1.2.1 — Paging Infrastructure: Split Shell Memory Model
+ * A2 kept shell variables and script text in one flat array. For paging, code
+ * lines now live in a frame store while shell variables stay in a separate
+ * variable store. The rest of this file is built around that split.
+*/
+static MemoryEntry variable_store[VAR_STORE_SIZE];
+// Code pages live here in fixed-size frames of 3 lines each.
+static char *frame_store[FRAME_STORE_SIZE];
+// Per-frame metadata is what lets the page table translate logical pages to physical frames.
+static FrameEntry frame_table[MAX_FRAMES];
+// One canonical page table per loaded script so duplicate exec/source can share resident pages.
+static LoadedScriptEntry loaded_scripts[MAX_FRAMES];
+// Live PCB registry is needed because each PCB has its own page-table clone.
+static PcbRegistryNode *live_pcbs = NULL;
+
+/*
+ * 1.2.3 — LRU Replacement: Logical Time
+ * clock_value is the shared logical timestamp used by the replacement policy.
+ * Frames are stamped both when they are loaded into memory and when execution
+ * later fetches an instruction from them, so eviction picks the occupied frame
+ * with the smallest recorded timestamp.
+*/
 static unsigned long clock_value = 0;
 
 static int clone_page_table(const int *src, int num_pages, int **out_copy) {
@@ -93,6 +112,9 @@ static void clear_frame(int frame) {
     frame_table[frame].page_num = -1;
     frame_table[frame].last_used = 0;
     frame_table[frame].num_using = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        frame_table[frame].using_pcb_pids[i] = -1;
+    }
 }
 
 static int mem_register_pcb_uses_frame(int frame, int pcb_pid) {
@@ -131,6 +153,7 @@ static int mem_unregister_pcb_from_frame(int frame, int pcb_pid) {
                 frame_table[frame].using_pcb_pids[j] = frame_table[frame].using_pcb_pids[j + 1];
             }
             frame_table[frame].num_using--;
+            frame_table[frame].using_pcb_pids[frame_table[frame].num_using] = -1;
             return 0;
         }
     }
@@ -138,35 +161,130 @@ static int mem_unregister_pcb_from_frame(int frame, int pcb_pid) {
     return 0;  // Not found, but not an error
 }
 
-static int mem_update_page_table_for_evicted_frame(int victim_frame) {
-    // A3 1.2.2: update all page tables that referenced the evicted frame
-    char victim_script[256];
-    int victim_page;
+static void mem_track_pcb_frame_usage(PCB *pcb, int register_usage) {
+    if (pcb == NULL || pcb->page_table == NULL) {
+        return;
+    }
 
-    strcpy(victim_script, frame_table[victim_frame].script_name);
-    victim_page = frame_table[victim_frame].page_num;
+    for (int page = 0; page < pcb->num_pages; page++) {
+        int frame = pcb->page_table[page];
 
-    // Find all loaded scripts that use this script name
+        if (frame < 0 || frame >= MAX_FRAMES) {
+            continue;
+        }
+
+        if (register_usage) {
+            mem_register_pcb_uses_frame(frame, pcb->pid);
+        } else {
+            mem_unregister_pcb_from_frame(frame, pcb->pid);
+        }
+    }
+}
+
+static void mem_invalidate_frame_references(int victim_frame) {
+    /*
+     * 1.2.2 — Demand Paging: Invalidate All Stale References After Eviction
+     * Eviction removes a physical frame, not a whole script. Any canonical
+     * script entry or live PCB clone that still points at that frame would now
+     * have a dangling pagetable entry, so we walk both sets and reset matches
+     * to -1. That guarantees the next access faults cleanly instead of reading
+     * whatever gets loaded into the recycled frame later.
+    */
+    for (int script_idx = 0; script_idx < MAX_FRAMES; script_idx++) {
+        if (!loaded_scripts[script_idx].in_use || loaded_scripts[script_idx].page_table == NULL) {
+            continue;
+        }
+
+        for (int page = 0; page < loaded_scripts[script_idx].num_pages; page++) {
+            if (loaded_scripts[script_idx].page_table[page] == victim_frame) {
+                loaded_scripts[script_idx].page_table[page] = -1;
+            }
+        }
+    }
+
+    for (PcbRegistryNode *node = live_pcbs; node != NULL; node = node->next) {
+        PCB *pcb = node->pcb;
+
+        if (pcb == NULL || pcb->page_table == NULL) {
+            continue;
+        }
+
+        for (int page = 0; page < pcb->num_pages; page++) {
+            if (pcb->page_table[page] == victim_frame) {
+                pcb->page_table[page] = -1;
+            }
+        }
+    }
+}
+
+static int mem_get_loaded_script_page_frame(const char *script_name, int page_num) {
+    int script_idx = find_loaded_script_index(script_name);
+
+    if (script_idx < 0 || loaded_scripts[script_idx].page_table == NULL) {
+        return -1;
+    }
+    if (page_num < 0 || page_num >= loaded_scripts[script_idx].num_pages) {
+        return -1;
+    }
+
+    return loaded_scripts[script_idx].page_table[page_num];
+}
+
+static void mem_publish_page_mapping(const char *script_name, int page_num, int frame) {
+    /*
+     * 1.2.2 — Demand Paging: Publish Newly Loaded Pages to Shared State
+
+     * The first process that loads a missing page should make that mapping
+     * visible to every other process running the same script. Otherwise one PCB
+     * would know where the page lives while another clone would still think the
+     * page is absent and fault again unnecessarily.
+    */
     for (int script_idx = 0; script_idx < MAX_FRAMES; script_idx++) {
         if (!loaded_scripts[script_idx].in_use) {
             continue;
         }
-
-        if (strcmp(loaded_scripts[script_idx].script_name, victim_script) != 0) {
+        if (strcmp(loaded_scripts[script_idx].script_name, script_name) != 0) {
             continue;
         }
-
-        // Found a loaded script with this name, mark the page as not loaded
-        if (victim_page >= 0 && victim_page < loaded_scripts[script_idx].num_pages) {
-            loaded_scripts[script_idx].page_table[victim_page] = -1;
+        if (page_num >= 0 && page_num < loaded_scripts[script_idx].num_pages) {
+            loaded_scripts[script_idx].page_table[page_num] = frame;
         }
     }
 
-    return 0;
+    for (PcbRegistryNode *node = live_pcbs; node != NULL; node = node->next) {
+        PCB *pcb = node->pcb;
+
+        if (pcb == NULL || pcb->page_table == NULL) {
+            continue;
+        }
+        if (strcmp(pcb->script_name, script_name) != 0) {
+            continue;
+        }
+        if (page_num < 0 || page_num >= pcb->num_pages) {
+            continue;
+        }
+
+        int old_frame = pcb->page_table[page_num];
+        if (old_frame >= 0 && old_frame != frame) {
+            mem_unregister_pcb_from_frame(old_frame, pcb->pid);
+        }
+
+        pcb->page_table[page_num] = frame;
+        if (frame >= 0 && frame < MAX_FRAMES) {
+            mem_register_pcb_uses_frame(frame, pcb->pid);
+        }
+    }
 }
 
-static int mem_evict_random_frame(void) {
-    // A3 1.2.2: evict the least recently used (LRU) occupied frame
+static int mem_evict_lru_frame(void) {
+    /*
+     * 1.2.3 — LRU Replacement: Victim Selection and Required Output
+     * When the frame store is full, paging is global: any occupied frame can be
+     * the victim, even if it belongs to another process. We choose the frame
+     * whose last_used timestamp is smallest, print its contents in the format
+     * required, then clear the frame so demand loading can
+     * reuse it immediately.
+    */
     int victim = -1;
     unsigned long min_last_used = (unsigned long)-1;
     
@@ -227,6 +345,12 @@ void mem_init(void) {
         loaded_scripts[i].line_count = 0;
         loaded_scripts[i].page_table = NULL;
     }
+
+    while (live_pcbs != NULL) {
+        PcbRegistryNode *next = live_pcbs->next;
+        free(live_pcbs);
+        live_pcbs = next;
+    }
 }
 
 void mem_set_value(char *var_in, char *value_in) {
@@ -256,7 +380,13 @@ char *mem_get_value(char *var_in) {
 }
 
 void mem_ensure_backing_store(void) {
-    // A3 1.2.1: wipe stale backing-store contents from prior runs, then recreate the directory.
+    /*
+     * 1.2.1 — Paging Infrastructure: Fresh Backing Store Per Shell Run
+
+     * Demand paging later depends on reopening scripts from disk by name. We
+     * clear out any stale files from prior runs first so the backing_store
+     * directory is always a clean snapshot of just the programs loaded now.
+    */
     system("rm -rf backing_store");
     system("mkdir backing_store");
 }
@@ -268,7 +398,9 @@ int mem_copy_script_to_backing_store(const char *source_path,
     FILE *dst = NULL;
     char line[1000];
 
-    // A3 1.2.1: copy one source script into the already prepared backing_store.
+    /* 1.2.1: every program is copied into backing_store before execution so the
+       original source path no longer matters when a later page fault needs to
+       reopen and seek through the script. */
     if (basename_from_path(source_path, script_name_out, script_name_size) != 0) {
         return 1;
     }
@@ -333,6 +465,45 @@ int mem_count_free_frames(void) {
     return free_frames;
 }
 
+int mem_register_pcb(PCB *pcb) {
+    PcbRegistryNode *node = NULL;
+
+    if (pcb == NULL) {
+        return 1;
+    }
+
+    node = malloc(sizeof(PcbRegistryNode));
+    if (node == NULL) {
+        return 1;
+    }
+
+    node->pcb = pcb;
+    node->next = live_pcbs;
+    live_pcbs = node;
+    mem_track_pcb_frame_usage(pcb, 1);
+    return 0;
+}
+
+void mem_unregister_pcb(PCB *pcb) {
+    PcbRegistryNode **current = &live_pcbs;
+
+    if (pcb == NULL) {
+        return;
+    }
+
+    mem_track_pcb_frame_usage(pcb, 0);
+
+    while (*current != NULL) {
+        if ((*current)->pcb == pcb) {
+            PcbRegistryNode *node = *current;
+            *current = node->next;
+            free(node);
+            return;
+        }
+        current = &((*current)->next);
+    }
+}
+
 int mem_is_script_loaded(const char *script_name) {
     // A3 1.2.1: tells exec/source whether frames can be shared for this script.
     return find_loaded_script_index(script_name) >= 0;
@@ -360,7 +531,14 @@ int mem_clone_script_page_table(const char *script_name,
 
 int mem_load_script_from_backing_store(const char *backing_path, const char *script_name,
                                        int total_lines, int **page_table_out, int *num_pages_out) {
-    // A3 1.2.1: eager-load every page from the backing-store file into frames.
+    /*
+     * 1.2.1 — Paging Infrastructure: Eager Page Loading
+
+     * This is the original paging setup path from 1.2.1: copy the whole script
+     * into frames up front, but let each page land in any free frame. The page
+     * table records where each logical page ended up, so pages do not need to
+     * be contiguous in physical memory.
+    */
     FILE *script = NULL;
     int *page_table = NULL;
     // A3 1.2.1: round up total lines to whole pages of 3 lines each.
@@ -400,8 +578,8 @@ int mem_load_script_from_backing_store(const char *backing_path, const char *scr
         page_table[page] = frame;
         frame_table[frame].occupied = 1;
         frame_table[frame].page_num = page;
-        frame_table[frame].last_used = clock_value++;
         snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
+        frame_table[frame].last_used = clock_value++;
 
         // A3 1.2.1: each frame always holds exactly three line slots.
         for (int offset = 0; offset < PAGE_SIZE; offset++) {
@@ -432,7 +610,14 @@ int mem_load_script_from_backing_store(const char *backing_path, const char *scr
 
 int mem_load_initial_pages(const char *backing_path, const char *script_name,
                            int total_lines, int **page_table_out, int *num_pages_out) {
-    // A3 1.2.2: demand paging - load only first 1-2 pages initially.
+    /*
+     * 1.2.2 — Demand Paging: Initial Resident Set
+
+     * Demand paging keeps startup cheap by loading only the first one or two
+     * pages of each script. The page table still has one entry per logical
+     * page, but anything not resident starts at -1 so execution can detect the
+     * first access as a page fault.
+    */
     FILE *script = NULL;
     int *page_table = NULL;
     // Total number of pages (including future pages not yet loaded)
@@ -459,7 +644,7 @@ int mem_load_initial_pages(const char *backing_path, const char *script_name,
         return 1;
     }
 
-    // Initialize all pages to -1 (not loaded)
+    // Pages not loaded yet are marked -1 so the scheduler can treat them as faults.
     for (int i = 0; i < num_pages; i++) {
         page_table[i] = -1;
     }
@@ -477,8 +662,8 @@ int mem_load_initial_pages(const char *backing_path, const char *script_name,
         page_table[page] = frame;
         frame_table[frame].occupied = 1;
         frame_table[frame].page_num = page;
-        frame_table[frame].last_used = clock_value++;
         snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
+        frame_table[frame].last_used = clock_value++;
 
         // Load PAGE_SIZE lines into the frame
         for (int offset = 0; offset < PAGE_SIZE; offset++) {
@@ -502,8 +687,8 @@ int mem_load_initial_pages(const char *backing_path, const char *script_name,
         }
     }
 
-    // If we loaded fewer than all pages, seek to end of initial loaded content
-    // This prepares for demand loading the rest later
+    // We do not keep this file handle for future faults; later loads reopen the
+    // backing-store copy and seek directly to the missing page on demand.
     for (int remaining = pages_to_load * PAGE_SIZE; remaining < total_lines; remaining++) {
         if (fgets(line, sizeof(line), script) == NULL) {
             break;
@@ -517,8 +702,20 @@ int mem_load_initial_pages(const char *backing_path, const char *script_name,
 
 int mem_demand_load_page(int *page_table, int page_num, const char *backing_path,
                          const char *script_name, int total_lines) {
-    // A3 1.2.2: load a specific page on demand when accessed.
-    // Returns: 0 = success, 1 = page fault (had to evict), 2 = error
+    /* 
+     * 1.2.2 — Demand Paging: Page Fault Handling
+
+     * This is the slow path when execution reaches a logical page whose table
+     * entry is -1. We either grab a free frame or evict an LRU victim, reopen
+     * the backing-store copy of the script, seek to the missing page, load its
+     * three lines, and then publish the new mapping to every process that
+     * shares the same script.
+
+     * Return values:
+     *   0 = page loaded without eviction
+     *   1 = page loaded after eviction
+     *   2 = error
+    */
     FILE *script = NULL;
     int frame = -1;
     int num_pages = (total_lines + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -535,17 +732,23 @@ int mem_demand_load_page(int *page_table, int page_num, const char *backing_path
         return 0;
     }
 
+    // Shared-script execution means another PCB may have faulted this page in first.
+    int shared_frame = mem_get_loaded_script_page_frame(script_name, page_num);
+    if (shared_frame >= 0) {
+        mem_publish_page_mapping(script_name, page_num, shared_frame);
+        return 0;
+    }
+
     // Find a free frame
     frame = find_free_frame();
     if (frame < 0) {
-        // A3 1.2.2: no free frame, evict a random one - prints "Page fault! Victim..." 
-        frame = mem_evict_random_frame();
+        // A3 1.2.2: no free frame, evict the LRU page - prints "Page fault! Victim..."
+        frame = mem_evict_lru_frame();
         if (frame < 0) {
             return 2;  // Error - eviction failed
         }
-        
-        // Update the page table of the evicted script to mark page as not loaded
-        mem_update_page_table_for_evicted_frame(frame);
+
+        mem_invalidate_frame_references(frame);
         had_to_evict = 1;
     } else {
         // A3 1.2.2: page fault without needing eviction (frame store not full)
@@ -557,7 +760,7 @@ int mem_demand_load_page(int *page_table, int page_num, const char *backing_path
         return 2;
     }
 
-    // Seek to the start of the page
+    // Skip exactly page_num * PAGE_SIZE logical lines so the next read starts at the missing page.
     int line_to_read = page_num * PAGE_SIZE;
     for (int i = 0; i < line_to_read; i++) {
         if (fgets(line, sizeof(line), script) == NULL) {
@@ -567,11 +770,10 @@ int mem_demand_load_page(int *page_table, int page_num, const char *backing_path
     }
 
     // Load this page into the frame
-    page_table[page_num] = frame;
     frame_table[frame].occupied = 1;
     frame_table[frame].page_num = page_num;
-    frame_table[frame].last_used = clock_value++;
     snprintf(frame_table[frame].script_name, sizeof(frame_table[frame].script_name), "%s", script_name);
+    frame_table[frame].last_used = clock_value++;
 
     for (int offset = 0; offset < PAGE_SIZE; offset++) {
         int physical_index = frame * PAGE_SIZE + offset;
@@ -586,7 +788,6 @@ int mem_demand_load_page(int *page_table, int page_num, const char *backing_path
         if (stored_line == NULL) {
             fclose(script);
             clear_frame(frame);
-            page_table[page_num] = -1;
             return 2;
         }
 
@@ -594,8 +795,9 @@ int mem_demand_load_page(int *page_table, int page_num, const char *backing_path
     }
 
     fclose(script);
+    mem_publish_page_mapping(script_name, page_num, frame);
     
-    // Return 1 if we had to evict (process should be interrupted for page fault)
+    // The scheduler uses this to decide whether the current timeslice should stop after the fault.
     return had_to_evict ? 1 : 0;
 }
 
@@ -665,7 +867,14 @@ void mem_release_frames(const int *page_table, int num_pages) {
 }
 
 char *mem_get_frame_line(int frame, int offset) {
-    // A3 1.2.1: convert frame + offset into one physical line in the frame store.
+    /*
+     * 1.2.1 / 1.2.3 — Address Translation and LRU Touch
+
+     * After the scheduler translates PC -> page -> frame, this helper converts
+     * frame + offset into one physical line slot. A successful fetch refreshes
+     * the frame's LRU timestamp here, but it is not the only place that happens:
+     * the page-load paths also stamp frames when they first enter memory.
+    */
     int physical_index = frame * PAGE_SIZE + offset;
 
     // A3 1.2.1: scheduler fetches instructions through this physical frame lookup.
@@ -673,7 +882,7 @@ char *mem_get_frame_line(int frame, int offset) {
         return NULL;
     }
 
-    // A3 1.2.2: update LRU timestamp on frame access
+    // Refresh LRU on fetch; load paths also stamp frames when they are first loaded.
     if (frame_table[frame].occupied) {
         frame_table[frame].last_used = clock_value++;
     }
