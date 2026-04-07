@@ -43,13 +43,20 @@ static char* get_current_instruction(PCB *current);
 static int scheduler_run_fcfs(void) {
     // 1.2.1 base scheduler behavior. 1.2.2 exec FCFS also lands here.
     // A3 1.2.1: process teardown now frees only PCB-owned state.
+    // A3 1.2.2: handle page faults by re-enqueueing process
     int last_error = 0;
     PCB *current = NULL;
 
     while ((current = scheduler_pop_forced_first_if_any()) != NULL
            || (current = ready_queue_pop_head()) != NULL) {
         last_error = run_process_slice(current, -1, last_error);
-        free_pcb(current);
+        
+        // A3 1.2.2: if process hit a page fault and still has work, re-enqueue it
+        if (current->PC < current->job_time) {
+            ready_queue_add_to_tail(current);
+        } else {
+            free_pcb(current);
+        }
     }
 
     return last_error;
@@ -74,6 +81,23 @@ static int run_process_slice(PCB *current, int max_instructions, int last_error)
     while (current->PC < current->job_time
            && (max_instructions < 0 || executed < max_instructions)) {
         char *line = get_current_instruction(current);
+        
+        // A3 1.2.2: if page not loaded, try demand loading
+        if (line == NULL && current->backing_path[0] != '\0') {
+            int page = current->PC / PAGE_SIZE;
+            if (page >= 0 && page < current->num_pages && current->page_table[page] < 0) {
+                // Page fault - try to load the page on demand
+                int load_result = mem_demand_load_page(current->page_table, page, current->backing_path,
+                                                        current->script_name, current->job_time);
+                if (load_result == 0 || load_result == 1) {
+                    // A3 1.2.2: any page fault (with or without eviction) interrupts execution
+                    // Process is placed back at end of ready queue by scheduler
+                    break;
+                }
+                // load_result == 2 is an error, just continue (line stays NULL)
+            }
+        }
+        
         // A3 1.2.1: padding is stored as "", and parseInput safely treats that as a no-op.
         if (line != NULL) {
             last_error = parseInput(line);

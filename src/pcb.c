@@ -17,6 +17,7 @@ PCB* make_pcb(const char *script_name, int job_time, int num_pages, int *page_ta
     // A3 1.2.1: PCB now stores logical paging state instead of start/end indices.
     new_pcb->pid = ++pid_counter;
     snprintf(new_pcb->script_name, sizeof(new_pcb->script_name), "%s", script_name);
+    new_pcb->backing_path[0] = '\0';
     new_pcb->PC = 0;
     new_pcb->num_pages = num_pages;
     new_pcb->page_table = page_table;
