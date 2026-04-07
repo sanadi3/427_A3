@@ -36,9 +36,10 @@ static int run_process_slice(PCB *current, int max_instructions, int last_error)
      1.2.2 — Demand Paging: Fault Detection During Execution
      * The scheduler does not pre-check all needed pages. It tries to fetch the
      * current instruction, and if translation fails because the page-table
-     * entry is still -1, this loop triggers demand loading. The important part
-     * is that we break before PC++ on a fault, so the process retries the same
-     * logical instruction when it runs again.
+     * entry is still -1, this loop triggers demand loading. A real load still
+     * ends the slice so the process retries later, but a shared-script hit does
+     * not count as a page fault: we sync the mapping, refetch the same line,
+     * and keep using the remaining instructions in the current slice.
     */
     int executed = 0;
 
@@ -54,11 +55,14 @@ static int run_process_slice(PCB *current, int max_instructions, int last_error)
                 // Page fault - try to load the page on demand
                 int load_result = mem_demand_load_page(current->page_table, page, current->backing_path,
                                                         current->script_name, current->job_time);
-                if (load_result == 0 || load_result == 1) {
-                    // Stop the slice immediately so the ready-queue policy decides when this process retries.
+                if (load_result == 2) {
+                    // Another process already loaded the page, so refetch and keep going from the same PC.
+                    line = get_current_instruction(current);
+                } else if (load_result == 0) {
+                    // A real demand load interrupts the slice so the scheduler can requeue this process.
                     break;
                 }
-                // load_result == 2 is an error, just continue (line stays NULL)
+                // load_result == 1 is an error, so line stays NULL and the existing error path continues.
             }
         }
         
