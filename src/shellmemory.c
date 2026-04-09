@@ -300,7 +300,7 @@ static int mem_evict_lru_frame(void) {
     }
 
     // The expected output is five visible lines: header, label, three frame slots, footer.
-    printf("Page fault! Victim page contents:\n");
+    printf("Page fault! Victim page contents:\n\n");
     int base = victim * PAGE_SIZE;
     for (int i = 0; i < PAGE_SIZE; i++) {
         char *line = frame_store[base + i];
@@ -310,7 +310,7 @@ static int mem_evict_lru_frame(void) {
             printf("%s", line);
         }
     }
-    printf("End of victim page contents.\n");
+    printf("\nEnd of victim page contents.\n");
 
     // Clear the victim frame
     clear_frame(victim);
